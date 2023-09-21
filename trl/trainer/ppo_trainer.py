@@ -691,7 +691,7 @@ class PPOTrainer(BaseTrainer):
                     scores, scores_ref, active_full_logprobs, ref_full_logprobs, masks
                 )
             else:
-                rewards, non_score_reward = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
+                rewards, non_score_reward = self.compute_rewards(scores, scores_ref, all_logprobs, ref_logprobs, masks)
             timing["time/ppo/compute_rewards"] = time.time() - t
 
             t = time.time()
@@ -1038,7 +1038,7 @@ class PPOTrainer(BaseTrainer):
                 Log probabilities of the reference model, shape (`batch_size`, `response_length`)
         """
         rewards, non_score_rewards = [], []
-        for score, logprob, ref_logprob, mask in zip(scores, logprobs, ref_logprobs, masks):
+        for score, score_ref, logprob, ref_logprob, mask in zip(scores, scores_ref, logprobs, ref_logprobs, masks):
             # compute KL penalty (from difference in logprobs)
             kl = self._kl_penalty(logprob, ref_logprob)
             non_score_reward = -self.kl_ctl.value * kl
@@ -1052,15 +1052,15 @@ class PPOTrainer(BaseTrainer):
             reward_ref = non_score_reward_ref.clone()
             last_non_masked_index_ref = mask.nonzero()[-1]
             # reward is preference model score + KL penalty
-            reward_ref[last_non_masked_index_ref] += score
+            reward_ref[last_non_masked_index_ref] += score_ref
 
             # create a mean rewards
-            reward_mean = torch.mean(torch.stack([reward, reward_ref]), dim=0)
-            non_score_rewards_mean = torch.mean(torch.stack([non_score_reward, non_score_reward_ref]), dim=0)
+            reward_dif = reward - reward_ref
+            non_score_rewards_sum = non_score_reward + non_score_reward_ref
 
             # add to list
-            non_score_rewards.append(non_score_rewards_mean)
-            rewards.append(reward_mean)
+            non_score_rewards.append(non_score_rewards_sum)
+            rewards.append(reward_dif)
 
         return torch.stack(rewards), torch.stack(non_score_rewards)
 
@@ -1163,6 +1163,7 @@ class PPOTrainer(BaseTrainer):
             pg_loss = pg_loss * 0.0
             vf_loss = vf_loss * 0.0
             loss = loss * 0.0
+
 
         entropy = masked_mean(entropy_from_logits(logits), mask)
 
