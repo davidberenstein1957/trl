@@ -52,9 +52,12 @@ from ..core import (
     stats_to_np,
 )
 from ..import_utils import is_torch_greater_2_0
-from ..models import SUPPORTED_ARCHITECTURES, PreTrainedModelWrapper, create_reference_model
+from ..models import (
+    SUPPORTED_ARCHITECTURES,
+    PreTrainedModelWrapper,
+    create_reference_model,
+)
 from . import AdaptiveKLController, BaseTrainer, FixedKLController, PPOConfig
-
 
 MODEL_CARD_TEMPLATE = """---
 license: apache-2.0
@@ -417,6 +420,7 @@ class PPOTrainer(BaseTrainer):
         length_sampler: Callable = None,
         batch_size: int = 4,
         return_prompt: bool = True,
+        ref_model: bool = False,
         **generation_kwargs,
     ):
         """
@@ -445,13 +449,18 @@ class PPOTrainer(BaseTrainer):
                 length_sampler=length_sampler,
                 batch_size=batch_size,
                 return_prompt=return_prompt,
+                ref_model=ref_model,
                 **generation_kwargs,
             )
 
         else:
+            if ref_model:
+                model = self.ref_model
+            else:
+                model = self.model
             if length_sampler is not None:
                 generation_kwargs["max_new_tokens"] = length_sampler()
-            response = self.accelerator.unwrap_model(self.model).generate(
+            response = self.accelerator.unwrap_model(model).generate(
                 input_ids=query_tensor.unsqueeze(dim=0), **generation_kwargs
             )
 
@@ -467,6 +476,7 @@ class PPOTrainer(BaseTrainer):
         return_prompt: bool = True,
         pad_to_multiple_of: int = None,
         remove_padding: bool = True,
+        ref_model: bool = False,
         **generation_kwargs,
     ):
         outputs = []
@@ -497,7 +507,11 @@ class PPOTrainer(BaseTrainer):
                 return_tensors="pt",
             ).to(self.current_device)
 
-            generations = self.accelerator.unwrap_model(self.model).generate(**padded_inputs, **generation_kwargs)
+            if ref_model:
+                model = self.ref_model
+            else:
+                model = self.model
+            generations = self.accelerator.unwrap_model(model).generate(**padded_inputs, **generation_kwargs)
 
             for generation, mask in zip(generations, padded_inputs["attention_mask"]):
                 if not self.is_encoder_decoder:
@@ -569,7 +583,9 @@ class PPOTrainer(BaseTrainer):
         self,
         queries: List[torch.LongTensor],
         responses: List[torch.LongTensor],
+        responses_ref: List[torch.LongTensor],
         scores: List[torch.FloatTensor],
+        scores_ref: List[torch.FloatTensor],
     ):
         """
         Run a PPO optimisation step given a list of queries, model responses, and rewards.
@@ -588,6 +604,8 @@ class PPOTrainer(BaseTrainer):
         bs = self.config.batch_size
 
         queries, responses, scores = self._step_safety_checker(bs, queries, responses, scores)
+        queries, responses_ref, scores_ref = self._step_safety_checker(bs, queries, responses_ref, scores_ref)
+
 
         # if we want to push best model to the hub
         if hasattr(self, "highest_reward"):
@@ -670,7 +688,7 @@ class PPOTrainer(BaseTrainer):
                 ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
 
                 rewards, non_score_reward = self.compute_rewards(
-                    scores, active_full_logprobs, ref_full_logprobs, masks
+                    scores, scores_ref, active_full_logprobs, ref_full_logprobs, masks
                 )
             else:
                 rewards, non_score_reward = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
@@ -1003,6 +1021,7 @@ class PPOTrainer(BaseTrainer):
     def compute_rewards(
         self,
         scores: torch.FloatTensor,
+        scores_ref: torch.FloatTensor,
         logprobs: torch.FloatTensor,
         ref_logprobs: torch.FloatTensor,
         masks: torch.LongTensor,
@@ -1023,13 +1042,26 @@ class PPOTrainer(BaseTrainer):
             # compute KL penalty (from difference in logprobs)
             kl = self._kl_penalty(logprob, ref_logprob)
             non_score_reward = -self.kl_ctl.value * kl
-            non_score_rewards.append(non_score_reward)
             reward = non_score_reward.clone()
             last_non_masked_index = mask.nonzero()[-1]
-
             # reward is preference model score + KL penalty
             reward[last_non_masked_index] += score
-            rewards.append(reward)
+
+            kl_ref = self._kl_penalty(ref_logprob, logprob)
+            non_score_reward_ref = -self.kl_ctl.value * kl_ref
+            reward_ref = non_score_reward_ref.clone()
+            last_non_masked_index_ref = mask.nonzero()[-1]
+            # reward is preference model score + KL penalty
+            reward_ref[last_non_masked_index_ref] += score
+
+            # create a mean rewards
+            reward_mean = torch.mean(torch.stack([reward, reward_ref]), dim=0)
+            non_score_rewards_mean = torch.mean(torch.stack([non_score_reward, non_score_reward_ref]), dim=0)
+
+            # add to list
+            non_score_rewards.append(non_score_rewards_mean)
+            rewards.append(reward_mean)
+
         return torch.stack(rewards), torch.stack(non_score_rewards)
 
     def _kl_penalty(self, logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor) -> torch.FloatTensor:
