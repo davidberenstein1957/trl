@@ -1056,7 +1056,7 @@ class PPOTrainer(BaseTrainer):
 
             # create a mean rewards
             reward_dif = reward - reward_ref
-            non_score_rewards_sum = non_score_reward - non_score_reward_ref
+            non_score_rewards_sum = non_score_reward
 
             # add to list
             non_score_rewards.append(non_score_rewards_sum)
